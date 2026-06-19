@@ -1,0 +1,46 @@
+# CMake / 编译产物(src/build、cpp/build 全部中间产物与 libdcnv2.so 均在此)
+build/
+*.o
+*.a
+# 插件 libdcnv2.so:运行期 dlopen,cmake 重新编译即得
+*.so
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 独立数值测试可执行(无扩展名 ELF,nvcc 直接编出)
+test_dcn
+test_dcn_gemm
+test_dcn_int8
+/python/t
+
+# TensorRT 引擎
+*.engine
+
+# ONNX 导出图
+*.onnx
+
+# oracle / 中间二进制
+*.bin
+# dcn_io.npz(01 的 numpy 打包 oracle)
+*.npz
+
+# INT8 校准表
+*.cache
+
+# 08 生成的文本元数据
+det_meta.txt
+det_categories.txt
+det_ref.txt
+
+# 校准 / 测试 / 结果图
+calib_images/
+# detect 画框结果
+det_out.jpg
+# 本地测试输入
+test.png
+
+# OS / 编辑器杂物
+.DS_Store
+*.swp
