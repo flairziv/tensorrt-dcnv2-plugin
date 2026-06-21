@@ -176,3 +176,82 @@ void add_bias_launch(float* out, const float* bias, int Cout, int HW, cudaStream
     int total = Cout * HW, th = 256, bl = (total + th - 1) / th;   // 一个线程加一个输出元素
     add_bias_kernel<<<bl, th, 0, stream>>>(out, bias, Cout, HW);
 }
+
+// ============================================================================
+// FP16 / INT8 快速路径(im2col + cuBLAS GEMM),与 FP32 快速路径同构。
+// ============================================================================
+// FP16:cols 为 __half,供 cublasGemmEx。
+__global__ void deform_im2col_half_kernel(const __half* __restrict__ x, const __half* __restrict__ offset,
+                                          const __half* __restrict__ mask, __half* cols,
+                                          int Cin, int H, int W, int Ho, int Wo, int K, int stride, int pad, int dil) {
+    int HW = Ho * Wo, CKK = Cin * K * K;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CKK * HW) return;
+    int pos = idx % HW, r = idx / HW;
+    int j = r % K, i = (r / K) % K, ic = r / (K * K);
+    int oh = pos / Wo, ow = pos % Wo;
+    int p = i * K + j, base = oh * Wo + ow;
+    float dh = to_f(offset[((size_t)(2 * p)     * Ho) * Wo + base]);
+    float dw = to_f(offset[((size_t)(2 * p + 1) * Ho) * Wo + base]);
+    float m  = to_f(mask  [((size_t)p          * Ho) * Wo + base]);
+    float h_im = oh * stride - pad + i * dil + dh;
+    float w_im = ow * stride - pad + j * dil + dw;
+    const __half* xp = x + ((size_t)ic * H) * W;
+    cols[(size_t)r * HW + pos] = __float2half(m * bilinear<__half>(xp, H, W, h_im, w_im));
+}
+void deform_im2col_half_launch(const __half* x, const __half* offset, const __half* mask, __half* cols,
+                               int Cin, int H, int W, int Ho, int Wo,
+                               int K, int stride, int pad, int dil, cudaStream_t stream) {
+    int total = Cin * K * K * Ho * Wo, th = 256, bl = (total + th - 1) / th;
+    deform_im2col_half_kernel<<<bl, th, 0, stream>>>(x, offset, mask, cols, Cin, H, W, Ho, Wo, K, stride, pad, dil);
+}
+__global__ void add_bias_half_kernel(__half* out, const __half* __restrict__ bias, int Cout, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= Cout * HW) return;
+    out[idx] = __float2half(__half2float(out[idx]) + __half2float(bias[idx / HW]));
+}
+void add_bias_half_launch(__half* out, const __half* bias, int Cout, int HW, cudaStream_t stream) {
+    int total = Cout * HW, th = 256, bl = (total + th - 1) / th;
+    add_bias_half_kernel<<<bl, th, 0, stream>>>(out, bias, Cout, HW);
+}
+// INT8:cols 为 float = m * bilinear(x_int8)(整数域采样,scale 留到最后)。
+__global__ void deform_im2col_int8_kernel(const int8_t* __restrict__ x, const float* __restrict__ offset,
+                                          const float* __restrict__ mask, float* cols,
+                                          int Cin, int H, int W, int Ho, int Wo, int K, int stride, int pad, int dil) {
+    int HW = Ho * Wo, CKK = Cin * K * K;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CKK * HW) return;
+    int pos = idx % HW, r = idx / HW;
+    int j = r % K, i = (r / K) % K, ic = r / (K * K);
+    int oh = pos / Wo, ow = pos % Wo;
+    int p = i * K + j, base = oh * Wo + ow;
+    float dh = offset[((size_t)(2 * p)     * Ho) * Wo + base];
+    float dw = offset[((size_t)(2 * p + 1) * Ho) * Wo + base];
+    float m  = mask  [((size_t)p          * Ho) * Wo + base];
+    float h_im = oh * stride - pad + i * dil + dh;
+    float w_im = ow * stride - pad + j * dil + dw;
+    const int8_t* xp = x + ((size_t)ic * H) * W;
+    cols[(size_t)r * HW + pos] = m * bilinear<int8_t>(xp, H, W, h_im, w_im);
+}
+void deform_im2col_int8_launch(const int8_t* x, const float* offset, const float* mask, float* cols,
+                               int Cin, int H, int W, int Ho, int Wo, int K, int stride, int pad, int dil, cudaStream_t stream) {
+    int total = Cin * K * K * Ho * Wo, th = 256, bl = (total + th - 1) / th;
+    deform_im2col_int8_kernel<<<bl, th, 0, stream>>>(x, offset, mask, cols, Cin, H, W, Ho, Wo, K, stride, pad, dil);
+}
+__global__ void dequant_weight_kernel(const int8_t* __restrict__ w, float* wf, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) wf[idx] = (float)w[idx];
+}
+void dequant_weight_launch(const int8_t* w, float* wf, int n, cudaStream_t stream) {
+    int th = 256, bl = (n + th - 1) / th;
+    dequant_weight_kernel<<<bl, th, 0, stream>>>(w, wf, n);
+}
+__global__ void add_bias_scale_kernel(float* out, const float* __restrict__ bias, float scale, int Cout, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= Cout * HW) return;
+    out[idx] = out[idx] * scale + bias[idx / HW];
+}
+void add_bias_scale_launch(float* out, const float* bias, float scale, int Cout, int HW, cudaStream_t stream) {
+    int total = Cout * HW, th = 256, bl = (total + th - 1) / th;
+    add_bias_scale_kernel<<<bl, th, 0, stream>>>(out, bias, scale, Cout, HW);
+}

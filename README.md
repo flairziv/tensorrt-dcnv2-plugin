@@ -59,23 +59,24 @@ TensorRT 引擎(DCN 走本插件;backbone FP16 或 INT8 校准 = 混合精度)
    - detect:含检测头引擎 + anchor 解码 + class-aware NMS,端到端出框
 ```
 
-DCN 插件内部:`enqueue` 按精度分派 —— FP32 走 im2col + cuBLAS GEMM(快速路径);FP16/INT8 走逐元素 kernel(见"工程边界")。
+DCN 插件内部:`enqueue` 按精度分派,三条路径均为 im2col + cuBLAS GEMM —— FP32 用 `cublasSgemm`;FP16 用 `cublasGemmEx`(FP16 输入 + FP32 累加,tensor core);INT8 用整数域 im2col + `cublasSgemm`,x_scale*w_scale 推迟到 `add_bias_scale` 末步施加(利用 GEMM 线性)。
 
 ## 目录
 
 ```
 src/   dcn_kernel.{h,cu}  DCN kernel(naive FP32/FP16/INT8 + im2col + bias)
        dcn_plugin.cpp     IPluginV3 + Creator + REGISTER_TENSORRT_PLUGIN
-       test_dcn*.cu       独立数值验证(FP32 / im2col-GEMM / INT8)
+       test_dcn*.cu       独立数值验证(FP32 / im2col-GEMM / INT8 / half-GEMM / int8-GEMM)
        CMakeLists.txt     -> libdcnv2.so
 python/ 01 oracle + 导出自定义节点 ONNX / 02 plugin 端到端对齐
         03 FP32 / FP16 基准 / detector.py(RetinaNet + DCN)/ 04 真实检测
         05 backbone -> TRT 特征对齐 / 06 混合精度 / 07 保存 backbone 引擎
         08 导出含检测头引擎 + anchors + 参考 / probe_export.py 导出路径探查
+        09 显式 Q/DQ PTQ(ModelOpt ONNX flow,无校准器) / dcn_ort_op.py 向量化 DCN forward + ORT custom op
 cpp/   trt_engine.h       可复用 TRT 引擎封装(RAII)
        dcn_detector.h     RetinaNet 后处理(anchor 解码 + class-aware NMS)
        dcn_infer.cpp      backbone 引擎部署 + cudaEvent 延迟基准
-       detect_main.cpp    纯 C++ 端到端检测(可选 OpenCV 读图/画框)
+       detect_main.cpp    纯 C++ 端到端检测(可选 OpenCV 读图/画框;--bench 出延迟基准)
 ```
 
 ## 快速复现(WSL + CUDA 12.6 + TensorRT 10.16;conda 环境含 torch/torchvision/onnx/polygraphy)
@@ -110,14 +111,25 @@ export LD_LIBRARY_PATH=$(python -c "import tensorrt_libs,os;print(os.path.dirnam
 python 08_export_det_engine.py image.jpg     # 生成 det.engine / anchors.bin / det_*.txt
 ../cpp/build/detect det.engine ../src/build/libdcnv2.so .            # 与 Python 参考对齐
 ../cpp/build/detect det.engine ../src/build/libdcnv2.so . image.jpg  # 直接读图并画框(需 OpenCV)
+
+# 7) 显式 Q/DQ INT8(ONNX flow,需 pip install "nvidia-modelopt[onnx]" onnxruntime-extensions)
+python 09_ptq_modelopt_qdq.py --onnx det.onnx --calib-dir calib_images \
+       --out det_qdq_int8.onnx --engine det_qdq_int8.engine   # 校准 + 插 Q/DQ + 构建 INT8 引擎(DCN 保持 FP32)
+
+# 8) 延迟基准:INT8 vs FP16(同一辅助文件,仅换引擎)
+../cpp/build/detect det_qdq_int8.engine ../src/build/libdcnv2.so . --bench
+../cpp/build/detect det.engine          ../src/build/libdcnv2.so . --bench
 ```
 
 ## 工程边界
 
 - DCN 不易量化:TRT 量化器不会自动量化 plugin,仅按 `supportsFormatCombination` 声明的精度运行。
   实务推荐混合精度(backbone 低精度 + DCN 高精度),而非强制 DCN 走 INT8(收益有限且精度风险较高)。
-- 快速路径当前为 FP32(im2col + `cublasSgemm`);FP16/INT8 仍走逐元素 kernel。FP16 GEMM
-  (`cublasGemmEx` 走 tensor core)为后续优化方向。
+- 三条精度路径均为 im2col + cuBLAS GEMM:FP32 `cublasSgemm`、FP16 `cublasGemmEx`(tensor core)、
+  INT8 整数域 im2col + `cublasSgemm`(scale 末步施加)。各路径均有独立单元测试(half/int8 相对误差 0.05% / 1.27%)。
+- INT8 在本卡未快于 FP16:det 引擎纯 GPU 推理 INT8 3.10 ms vs FP16 4.44 ms 看似更快,但端到端(含 CPU 后处理)
+  P50 17.18 vs 18.37 ms 差距很小 —— 瓶颈在 RetinaNet 全 anchor 解码 + NMS 的 CPU 后处理(约 14 ms),而非 GPU
+  推理;优化方向为 GPU 端解码/NMS(如 EfficientNMS plugin)或提高 score 阈值。
 - 拆分部署:检测头与 NMS 置于 PyTorch / C++,重计算(backbone + DCN)上 TRT,为常见边缘部署形态。
 - DCN 采用 identity 初始化(offset 约 0,mask 约 1)插入预训练检测器,无需训练即保持检测效果,聚焦部署而非训练精度。
 - 引擎绑定 GPU 架构与 TRT 版本,更换显卡或版本需重新构建。

@@ -12,6 +12,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -74,8 +78,27 @@ public:
             off += hwa;
         }
 
-        // 4) 跨层 class-aware NMS 并限制总数。
-        return nmsClassAware(cand);
+
+    void bench(const float* input, int iters = 200, int warmup = 20) {
+        detect(input);                                      // 先完整跑一次:拷贝输入到设备 + 触发引擎惰性初始化
+        float gpu_ms = mEngine.benchmark(iters);            // 1) 纯 GPU:复用 TrtEngine 的 cudaEvent 计时(内部自带一次预热)
+        for (int i = 0; i < warmup; ++i) detect(input);     // 2) 端到端预热(丢弃前 warmup 帧)
+        std::vector<double> ts;                             // 收集每帧端到端耗时(ms),排序后取分位数
+        ts.reserve(iters);
+        for (int i = 0; i < iters; ++i) {                   // 2) 逐帧墙钟计时(steady_clock 单调,适合测时长)
+            auto t0 = std::chrono::steady_clock::now();
+            detect(input);                                  // 完整一帧:H2D + 推理 + D2H + 解码 + NMS
+            auto t1 = std::chrono::steady_clock::now();
+            ts.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        std::sort(ts.begin(), ts.end());                    // 升序排序,便于取 P50 / P90(分位数比均值更能反映抖动)
+        double mean = 0.0;
+        for (double v : ts) mean += v;
+        mean /= ts.size();
+        std::printf("[bench] GPU 纯推理 enqueueV3(不含 H2D/D2H/后处理): %.3f ms/帧 (mean, %d 次)\n",
+                    gpu_ms, iters);
+        std::printf("[bench] 端到端 detect()(H2D+推理+D2H+解码+NMS): P50=%.3f  P90=%.3f  mean=%.3f ms (%d 次)\n",
+                    ts[ts.size() / 2], ts[(size_t)(ts.size() * 0.9)], mean, iters);
     }
 
 private:

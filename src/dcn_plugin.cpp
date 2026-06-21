@@ -109,9 +109,12 @@ public:
     // 快速路径(FP32)所需 scratch:cols[Cin*K*K, Ho*Wo](float),TRT 据此预留 workspace。
     size_t getWorkspaceSize(DynamicPluginTensorDesc const* in, int32_t /*nbIn*/,
                             DynamicPluginTensorDesc const* out, int32_t /*nbOut*/) const noexcept override {
-        int Cin = in[0].desc.dims.d[1];                             // 由输入 x 取 Cin
-        int Ho = out[0].desc.dims.d[2], Wo = out[0].desc.dims.d[3]; // 由输出取 Ho/Wo
-        return (size_t)Cin * mKernel * mKernel * Ho * Wo * sizeof(float);  // im2col 中间矩阵字节数
+        int Cin = in[0].desc.dims.d[1];                              // 由输入 x 取 Cin
+        int Cout = out[0].desc.dims.d[1];                            // 由输出取 Cout
+        int Ho = out[0].desc.dims.d[2], Wo = out[0].desc.dims.d[3];  // 由输出取 Ho/Wo
+        size_t CKK = (size_t)Cin * mKernel * mKernel, HW = (size_t)Ho * Wo;
+        // 三条路径中 INT8 需求最大:cols[CKK*HW] + 反量化 weight[Cout*CKK]
+        return (CKK * HW + (size_t)Cout * CKK) * sizeof(float);
     }
 
     // ---------- Runtime ----------(执行期)
@@ -122,39 +125,51 @@ public:
         const auto& xd = inDesc[0].dims;     // x[N,Cin,H,W]
         const auto& wd = inDesc[3].dims;     // weight[Cout,Cin,K,K]
         const auto& yd = outDesc[0].dims;    // y[N,Cout,Ho,Wo]
-        int N = xd.d[0], Cin = xd.d[1], H = xd.d[2], W = xd.d[3];
+        int Cin = xd.d[1], H = xd.d[2], W = xd.d[3];
         int Cout = wd.d[0], Ho = yd.d[2], Wo = yd.d[3];
-        // 输入顺序:0=x 1=offset 2=mask 3=weight 4=bias;按 x 的精度分派。
+        int CKK = Cin * mKernel * mKernel, HW = Ho * Wo;
+        if (!mHandle) cublasCreate(&mHandle);                        // 惰性创建 cuBLAS 句柄
+        cublasSetStream(mHandle, stream);                            // 绑定到同一 stream 保证执行有序
+        float one = 1.f, zero = 0.f;                                 // GEMM 系数 alpha / beta
+        // 输入顺序:0=x 1=offset 2=mask 3=weight 4=bias;三条路径均为 im2col + cuBLAS GEMM。
         if (inDesc[0].type == DataType::kINT8) {
-            // 混合精度:x/weight 为 INT8(scale 取自 desc.scale),offset/mask/bias 为 FP32,输出 FP32。
-            dcnv2_launch_int8(
-                static_cast<const int8_t*>(inputs[0]), inDesc[0].scale,       // x 与 x_scale(TRT 校准得到的 per-tensor scale)
-                static_cast<const float*>(inputs[1]), static_cast<const float*>(inputs[2]),  // offset / mask(FP32)
-                static_cast<const int8_t*>(inputs[3]), inDesc[3].scale,       // weight 与 w_scale
-                static_cast<const float*>(inputs[4]), static_cast<float*>(outputs[0]),       // bias / 输出(FP32)
-                N, Cin, Cout, H, W, Ho, Wo, mKernel, mStride, mPad, mDil, stream);
+            // 整数域 im2col 得 float cols -> 反量化 weight -> SGEMM -> 施加 x_scale*w_scale 并加 bias。
+            float* cols = static_cast<float*>(workspace);            // 前段:cols[CKK,HW]
+            float* wf = cols + (size_t)CKK * HW;                     // 后段:反量化后的 weight[Cout,CKK]
+            deform_im2col_int8_launch(static_cast<const int8_t*>(inputs[0]),
+                                      static_cast<const float*>(inputs[1]),
+                                      static_cast<const float*>(inputs[2]), cols,
+                                      Cin, H, W, Ho, Wo, mKernel, mStride, mPad, mDil, stream);
+            dequant_weight_launch(static_cast<const int8_t*>(inputs[3]), wf, Cout * CKK, stream);
+            cublasSgemm(mHandle, CUBLAS_OP_N, CUBLAS_OP_N, HW, Cout, CKK, &one,
+                        cols, HW, wf, CKK, &zero, static_cast<float*>(outputs[0]), HW);
+            add_bias_scale_launch(static_cast<float*>(outputs[0]), static_cast<const float*>(inputs[4]),
+                                  inDesc[0].scale * inDesc[3].scale, Cout, HW, stream);
         } else if (inDesc[0].type == DataType::kHALF) {
-            dcnv2_launch_half(                                               // FP16 路径:走 half 朴素 kernel
-                static_cast<const __half*>(inputs[0]), static_cast<const __half*>(inputs[1]),
-                static_cast<const __half*>(inputs[2]), static_cast<const __half*>(inputs[3]),
-                static_cast<const __half*>(inputs[4]), static_cast<__half*>(outputs[0]),
-                N, Cin, Cout, H, W, Ho, Wo, mKernel, mStride, mPad, mDil, stream);
+            // FP16:half im2col -> cublasGemmEx(FP16 输入,FP32 累加,tensor core)-> 加 bias。
+            __half* cols = static_cast<__half*>(workspace);
+            deform_im2col_half_launch(static_cast<const __half*>(inputs[0]),
+                                      static_cast<const __half*>(inputs[1]),
+                                      static_cast<const __half*>(inputs[2]), cols,
+                                      Cin, H, W, Ho, Wo, mKernel, mStride, mPad, mDil, stream);
+            cublasGemmEx(mHandle, CUBLAS_OP_N, CUBLAS_OP_N, HW, Cout, CKK,
+                         &one, cols, CUDA_R_16F, HW,
+                               static_cast<const __half*>(inputs[3]), CUDA_R_16F, CKK,
+                         &zero, static_cast<__half*>(outputs[0]), CUDA_R_16F, HW,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            add_bias_half_launch(static_cast<__half*>(outputs[0]),
+                                 static_cast<const __half*>(inputs[4]), Cout, HW, stream);
         } else {
-            // FP32 快速路径:im2col(每采样计算一次)-> cuBLAS GEMM(weight@cols)-> 加 bias。
-            float* cols = static_cast<float*>(workspace);                    // 复用 TRT 提供的 workspace 作为 cols 矩阵
-            deform_im2col_launch(static_cast<const float*>(inputs[0]),       // 1) 可变形采样展开为 cols[CKK,HW]
+            // FP32 快速路径:im2col -> cuBLAS SGEMM -> 加 bias。
+            float* cols = static_cast<float*>(workspace);
+            deform_im2col_launch(static_cast<const float*>(inputs[0]),
                                  static_cast<const float*>(inputs[1]),
                                  static_cast<const float*>(inputs[2]), cols,
                                  Cin, H, W, Ho, Wo, mKernel, mStride, mPad, mDil, stream);
-            if (!mHandle) cublasCreate(&mHandle);                            // 惰性创建 cuBLAS 句柄(首次 enqueue)
-            cublasSetStream(mHandle, stream);                                // 绑定到同一 stream 保证执行有序
-            int CKK = Cin * mKernel * mKernel, HW = Ho * Wo;                 // 矩阵维度
-            float one = 1.f, zero = 0.f;                                     // GEMM 系数 alpha / beta
-            // 行主序 out[Cout,HW] = weight[Cout,CKK] @ cols[CKK,HW] 在列主序 cuBLAS 下的标准写法。
-            cublasSgemm(mHandle, CUBLAS_OP_N, CUBLAS_OP_N, HW, Cout, CKK, &one,  // 2) GEMM:m=HW, n=Cout, k=CKK
-                        cols, HW, static_cast<const float*>(inputs[3]), CKK, &zero,  // A=cols(ld HW),B=weight(ld CKK)
-                        static_cast<float*>(outputs[0]), HW);                        // C=输出(ld HW)
-            add_bias_launch(static_cast<float*>(outputs[0]),                 // 3) 广播加 bias
+            cublasSgemm(mHandle, CUBLAS_OP_N, CUBLAS_OP_N, HW, Cout, CKK, &one,
+                        cols, HW, static_cast<const float*>(inputs[3]), CKK, &zero,
+                        static_cast<float*>(outputs[0]), HW);
+            add_bias_launch(static_cast<float*>(outputs[0]),
                             static_cast<const float*>(inputs[4]), Cout, HW, stream);
         }
         return 0;

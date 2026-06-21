@@ -13,6 +13,8 @@ __pycache__/
 test_dcn
 test_dcn_gemm
 test_dcn_int8
+test_dcn_int8_gemm
+test_dcn_half_gemm
 /python/t
 
 # TensorRT 引擎

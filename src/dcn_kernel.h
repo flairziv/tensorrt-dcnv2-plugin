@@ -35,3 +35,17 @@ void deform_im2col_launch(const float* x, const float* offset, const float* mask
                           int K, int stride, int pad, int dil, cudaStream_t stream);  // 不含 N 参数:仅支持单 batch
 // GEMM 之后,将 bias[oc] 广播加到 out[Cout,HW]。
 void add_bias_launch(float* out, const float* bias, int Cout, int HW, cudaStream_t stream);
+
+// FP16 快速路径(im2col + cuBLAS GEMM,N=1):cols 为 __half,供 cublasGemmEx(FP16 输入 + FP32 累加)。
+void deform_im2col_half_launch(const __half* x, const __half* offset, const __half* mask, __half* cols,
+                               int Cin, int H, int W, int Ho, int Wo,
+                               int K, int stride, int pad, int dil, cudaStream_t stream);
+void add_bias_half_launch(__half* out, const __half* bias, int Cout, int HW, cudaStream_t stream);
+
+// INT8 快速路径(im2col + cuBLAS GEMM,N=1):cols = m*bilinear(x_int8)(整数域,不乘 x_scale);
+// weight 经 dequant_weight_launch 转 float;x_scale*w_scale 在 add_bias_scale_launch 统一施加。
+void deform_im2col_int8_launch(const int8_t* x, const float* offset, const float* mask, float* cols,
+                               int Cin, int H, int W, int Ho, int Wo,
+                               int K, int stride, int pad, int dil, cudaStream_t stream);
+void dequant_weight_launch(const int8_t* w, float* wf, int n, cudaStream_t stream);
+void add_bias_scale_launch(float* out, const float* bias, float scale, int Cout, int HW, cudaStream_t stream);

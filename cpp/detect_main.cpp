@@ -2,9 +2,15 @@
 //   1. 给定图片路径(需编译期找到 OpenCV):imread -> 预处理 -> DCNDetector.detect() -> 画框存 det_out.jpg。
 //   2. 不给图片:读取 det_input.bin -> detect -> 与 Python 参考 det_ref.txt 逐行对齐。
 //
+// detect_main.cpp —— 纯 C++ 端到端检测示例,三种模式:
+//   1. 给定图片路径(需编译期找到 OpenCV):imread -> 预处理 -> DCNDetector.detect() -> 画框存 det_out.jpg。
+//   2. 不给图片:读取 det_input.bin -> detect -> 与 Python 参考 det_ref.txt 逐行对齐。
+//   3. --bench:延迟基准,输出 GPU 纯推理与端到端 P50/P90(该开关可出现在任意位置)。
+//
 // 运行(在 python/ 目录,辅助文件位于此处):
 //   ../cpp/build/detect det.engine ../src/build/libdcnv2.so .                 # bin 对齐模式
 //   ../cpp/build/detect det.engine ../src/build/libdcnv2.so . image.jpg       # 图片模式(需 OpenCV)
+//   ../cpp/build/detect det.engine ../src/build/libdcnv2.so . --bench         # 延迟基准(GPU 纯推理 + 端到端 P50/P90)
 
 #include "dcn_detector.h"
 
@@ -132,7 +138,54 @@ int main(int argc, char** argv) {
                             "安装 OpenCV 后重新 cmake(自动检测)即可;或使用 bin 模式(不传图片参数)。\n");
             return 1;
 #endif
+        }int main(int argc, char** argv) {
+    // 参数解析:--bench 为可选开关,可出现在任意位置;其余按出现顺序作为位置参数。
+    // 如此 "detect eng plugin . --bench" 中的 --bench 不会被误当作第 4 个位置参数(图片路径)。
+    bool bench = false;
+    std::vector<std::string> pos;                           // 去除 --bench 后的位置参数
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--bench") bench = true;                   // 命中开关 -> 延迟基准模式
+        else pos.push_back(a);
+    }
+    std::string engPath = pos.size() > 0 ? pos[0] : "det.engine";                  // 位置 1:引擎(换 INT8/FP16 即可对比)
+    std::string pluginPath = pos.size() > 1 ? pos[1] : "../src/build/libdcnv2.so"; // 位置 2:DCN 插件 .so
+    std::string auxDir = pos.size() > 2 ? pos[2] : ".";     // 位置 3:anchors/meta/categories/输入/参考 所在目录
+    std::string imgPath = pos.size() > 3 ? pos[3] : "";     // 位置 4(可选):图片路径
+
+    try {
+        dcn::DCNDetector det(engPath, pluginPath, auxDir);  // 加载引擎与辅助文件
+
+        if (bench) {                                        // 延迟基准模式(--bench)
+            // 准备一帧输入:优先使用命令行图片(需 OpenCV),否则读取 08 生成的 det_input.bin。
+            // 延迟与输入内容无关(卷积耗时固定),用任意一帧均可。
+            std::vector<float> input;
+#ifdef HAVE_OPENCV
+            if (!imgPath.empty()) {                         // 提供图片则预处理为引擎输入张量
+                cv::Mat bgr = cv::imread(imgPath);
+                if (bgr.empty()) { fprintf(stderr, "无法读取图片 %s\n", imgPath.c_str()); return 1; }
+                input = preprocess(bgr, det.inputSize());
+            }
+#endif
+            if (input.empty()) {                            // 无图片(或未链接 OpenCV)则读取 det_input.bin
+                input.resize(det.inputElems());
+                std::ifstream fin(auxDir + "/det_input.bin", std::ios::binary);
+                if (!fin) { fprintf(stderr, "缺少 det_input.bin(或传入图片),请先运行 08_export_det_engine.py\n"); return 1; }
+                fin.read(reinterpret_cast<char*>(input.data()), input.size() * sizeof(float));
+            }
+            det.bench(input.data());                        // 输出 GPU 纯推理 + 端到端 P50/P90/mean
+            return 0;
         }
+
+        if (!imgPath.empty()) {                             // 提供图片则进入图片模式
+#ifdef HAVE_OPENCV
+            return runImage(det, imgPath);
+#else
+            fprintf(stderr, "本 detect 未链接 OpenCV,无法直接读取图片。\n"
+                            "安装 OpenCV 后重新 cmake(自动检测)即可;或使用 bin 模式(不传图片参数)。\n");
+            return 1;
+#endif
+
         return runBinParity(det, auxDir);                   // 未提供图片则进入 bin 对齐模式
     } catch (const std::exception& e) {
         fprintf(stderr, "错误: %s\n", e.what());
